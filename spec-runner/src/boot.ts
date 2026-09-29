@@ -34,6 +34,14 @@ export interface BootOptions {
   now?: () => number;
   /** Injectable ToolDeps builder so tests can wire a fake server without real IO. */
   buildDeps?: (server: RunningServer) => ToolDeps;
+  /**
+   * Injectable `start`, defaulting to `@reticlehq/server`'s real one. The only reason to pass this is
+   * a test that needs to drive the `bridge.ready` rejection/cleanup path below deterministically — a
+   * real bind-race is, by construction, not something a test can reliably force to lose without timing
+   * it, which CLAUDE.md already treats as a bug in the test (reticlehq/reticle#1165 review, "Readiness
+   * failure lacks test coverage").
+   */
+  startServer?: typeof start;
 }
 
 /**
@@ -132,12 +140,15 @@ function isPortRaceLoss(error: unknown): boolean {
  * installing and tearing down a process-wide handler around every call would race concurrent specs
  * booting their own sessions in the same worker.
  *
- * The true TOCTOU race (a listener grabbing the port in the gap between the probe and the bind) has
- * no deterministic reproduction available without adding test-only seams to `start`/`probePresence` —
- * an artificially-timed test would be flaky by construction, which CLAUDE.md's own testing rules treat
- * as a bug in the test, not a property of the machine. This is instead verified by the code path
- * above; the pre-flight refusal (a port already occupied before this call begins) is what
- * `boot.test.ts` covers, deterministically.
+ * The true TOCTOU race (a listener grabbing the port in the gap between the probe and the bind) still
+ * has no deterministic reproduction on the real network — an artificially-timed test would be flaky by
+ * construction, which CLAUDE.md's own testing rules treat as a bug in the test, not a property of the
+ * machine. What IS deterministic, and now covered, is what `bootSession` does once that race is lost:
+ * `BootOptions.startServer` lets a test hand back a `RunningServer` whose `bridge.ready` rejects on
+ * demand, so `boot.test.ts` can assert the translation-to-refusal and the `server.close()` cleanup
+ * directly, without needing to actually win a race to exercise them (reticlehq/reticle#1165 review,
+ * "Readiness failure lacks test coverage"). The pre-flight refusal (a port already occupied before
+ * this call begins) is the other, simpler case `boot.test.ts` covers.
  */
 export async function bootSession(opts: BootOptions): Promise<BootedRun> {
   const port = opts.port ?? RETICLE_DEFAULT_PORT;
@@ -159,9 +170,10 @@ export async function bootSession(opts: BootOptions): Promise<BootedRun> {
     headless: opts.headless ?? true,
     ...(opts.port !== undefined ? { port: opts.port } : {}),
   };
+  const startServer = opts.startServer ?? start;
   let server: RunningServer;
   try {
-    server = await start(startOptions);
+    server = await startServer(startOptions);
   } catch (error) {
     if (isPortRaceLoss(error)) throw portTakenError(port, PortPresence.FOREIGN);
     throw error;
